@@ -5,7 +5,7 @@ from torch.nn import CrossEntropyLoss
 import math
 from siglip import SiglipVisionConfig, SiglipVisionModel
 
-clas GemmaConfig():
+class GemmaConfig():
 
     def __init__(
         self,
@@ -24,20 +24,141 @@ clas GemmaConfig():
         pad_token_id=None,
         **kwargs,
     ):
-    super().__init__()
-    self.vocab_size = vocab_size
-    self.max_position_embeddings = max_position_embeddings
-    self.hidden_size = hidden_size
-    self.num_hidden_layers = num_hidden_layers
-    self.num_attention_heads = num_attention_heads
-    self.head_dim = head_dim
-    self.num_key_value_heads = num_key_value_heads
-    self.rms_norm_eps = rms_norm_eps
-    self.rope_theta = rope_theta
-    self.attention_bias = attention_bias
-    self.attention_dropout = attention_dropout
-    self.pad_token_id = pad_token_id
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.max_position_embeddings = max_position_embeddings
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.head_dim = head_dim
+        self.num_key_value_heads = num_key_value_heads
+        self.rms_norm_eps = rms_norm_eps
+        self.rope_theta = rope_theta
+        self.attention_bias = attention_bias
+        self.attention_dropout = attention_dropout
+        self.pad_token_id = pad_token_id
 
+
+class GemmaRMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+    
+    def _norm(self, x):
+        # this  calculating the 1 / sqrt(mean(x^2)) and then multiply it with x. same as ai/RMS(a) in the paper
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x)
+        # llama does x.to(float16) * w while Gemma does (x*w).to(float16)
+        output = output * (1.0 + self.weight.float())
+        return output.type_as(x)
+
+
+
+class GemmaModel(nn.Module):
+
+    def __init__(self, config: GemmaConfig):
+        super().__init__()
+        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        # tie the weights of the embeddings and the logits layer
+        # this layer is [vocab_size, hidden_size] can be shared with the logits layer [hidden_size, vocab_size]
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=self.padding_idx)
+        self.layers = nn.ModuleList(
+            [GemmaDecoderLayer(config, layer_id) for layer_id in range(config.num_hidden_layers)]
+        )
+        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+    
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def forward(
+        self,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        kv_cache: Optional[KVCache] = None,
+    ) -> torch.FloatTensor:
+        # [Batch_Size, Seq_Len, Hidden_Size]
+        hidden_states = inputs_embeds
+        #[Batch_Size, Seq_len, Hidden_Size]
+        normalizer = torch.tensor(self.config.hidden_size ** 0.5, dtype=hidden_states.dtype)
+        hidden_states = hidden_states * normalizer
+
+        for decoder_layer in self.layers:
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                kv_cache=kv_cache,
+            )
+
+        hidden_states = self.norm(hidden_states)
+
+        #[Batch_Size, Seq_Len, Hidden_Size]
+        return hidden_states
+
+
+
+class GemmaForCausalLM(nn.Module):
+
+    def __init__(self, config: GemmaConfig):
+        super().__init__()
+        self.config = config
+        self.model = GemmaModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    # we share the weights between the embeddings and the logits layer
+    def tie_weights(self):
+        self.lm_head.weight = self.model.get_input_embeddings().weight
+    
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def forward(self,
+                attention_mask: Optional[torch.Tensor] = None,
+                position_ids: Optional[torch.Tensor] = None,
+                inputs_embeds: Optional[torch.Tensor] = None,
+                kv_cache: Optional[KVCache] = None
+        ) -> Tuple:
+        outputs = self.model(
+            attention_mask=attention_mask,
+            postion_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            kv_cache=kv_cache,
+        )
+
+        hidden_states = outputs
+        logits = self.lm_head(hidden_states)
+        logits = logits.float()
+
+        return_data = {
+            "logits": logits,
+        }
+
+        if kv_cache is not None:
+            return_data["kv_cache"] = kv_cache
+        
+        return return_data
+
+
+
+
+# convert the image features dims to the hidden size of the LLM
+class PaliGemmaMultiModalProjector(nn.Module):
+    def __init__(self, config: PaliGemmaConfig):
+        super().__init__()
+        self.linear = nn.Linear(config.vision_config.hidden_size, config.vision_config.projection_dim, bias=True)
+
+    def forward(self, image_features):
+        #[Batch_Size, Num_Patches, Hidden_Size] -> [Batch_Size, Num_Patches, Projection_Dim]
+        hidden_states = self.linear(image_features)
+        return hidden_states
 
 
 class PaliGemmaConfig:
@@ -129,17 +250,42 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         final_embeddings = final_embedding.masked_scatter(image_mask_expanded, scaled_image_features)
         final_embeddings = torch.where(pad_mask_expanded, torch.zeros_like(final_embeddings), final_embeddings)
 
-        
+        ### CREATE THE ATTENTION MASK
+
+        dtype, device = inputs_embeds.dtype, inputs_embeds.device
+        min_dtype = torch.finfo(dtype).min
+        q_len = inputs_embeds.shape[1]
+
+        if kv_cache is None or kv_cache.num_items() == 0:
+            # Do not mask any token, because we're in the prefill phase
+            # This only works when we have no padding
+            causal_mask = torch.full(
+                (batch_size, q_len, q_len), fill_value=0, dtype=dtype, device=device
+            )
+        else:
+            # Since we are generating tokens, the query must be a single token
+            assert q_len == 1, "Query length must be 1 during generation"
+            kv_len = kv_cache.num_items()
+            # when using the kv cache, we dont need to mask out anything because we are generating only 
+            # one token at a time
+            causal_mask = torch.full((batch_size, q_len, kv_len), fill_value=0, dtype=dtype, device=device)
+
+        # add the head dimension
+        # [Batch_Size, Seq_Len, Seq_Len] -> [Batch_Size, Num_Heads, Seq_Len, Seq_Len]
+        causal_mask = causal_mask.unsqueeze(1)
+
+        if kv_cache is not None and kv_cache.num_items() > 0:
+            # The position of the query is just the last position
+            position_ids =  attention_mask.cumsum(-1)[:, -1]
+            if position_ids.dim() == 1:
+                position_ids = position_ids.unsqueeze(0)
+        else:
+            #create a position_ids based on the size of the attention mask
+            # For masked tokens, use the number 1 as position.
+            position_ids = (attention_mask.cumsum(-1).masked_fill_((attention_mask == 0), 1) - 1)
 
 
-
-
-
-
-
-
-
-
+        return final_embeddings, causal_mask, position_ids
 
 
     def forward(

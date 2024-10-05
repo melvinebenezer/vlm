@@ -31,7 +31,7 @@ criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.01)
 
 # Training loop
-def train(epochs=10):
+def train(epochs=10000):
     for epoch in range(epochs):
         optimizer.zero_grad()
         outputs = model(X)

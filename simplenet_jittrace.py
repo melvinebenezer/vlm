@@ -18,6 +18,8 @@ class SimpleNet(nn.Module):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+# X is the input of shape (1000, 10) where 1000 is the number of samples and 10 is the number of features
+# y is the output of shape (1000, 1) where 1000 is the number of samples and 1 is the number of output features
 X = torch.randn(1000, 10).to(device)
 y = torch.randn(1000, 1).to(device)
 
